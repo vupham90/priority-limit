@@ -3,4 +3,4 @@ global:
 scrape_configs:
   - job_name: 'local_service'
     static_configs:
-      - targets: ['host.containers.internal:8080'] # Replace with your service
+      - targets: ['host.docker.internal:8080'] # Replace with your service

@@ -3,7 +3,6 @@ package prioritylimit
 import (
 	"context"
 	"fmt"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -15,9 +14,18 @@ type SimulationConfig struct {
 	WindowSize      time.Duration
 	TokensPerWindow int64
 
-	// Traffic generation rates (requests per second)
-	HighPriorityRPS   float64
-	NormalPriorityRPS float64
+	// Base traffic rates (requests per second)
+	HighPriorityBaseRPS   float64
+	NormalPriorityBaseRPS float64
+
+	// Pattern configuration
+	MinLoadPercent  float64 // Minimum load (e.g., 10%)
+	MaxLoadPercent  float64 // Maximum load (e.g., 300%)
+	RampUpDuration  float64 // Time to go from min to max in seconds
+	RampDownDuration float64 // Time to go from max to min in seconds
+
+	// Number of concurrent workers for high priority requests
+	HighPriorityWorkers int
 
 	// Duration to run simulation
 	Duration time.Duration
@@ -29,82 +37,110 @@ type SimulationResult struct {
 	Allowed  bool
 }
 
-// generateRandomIntervals creates a slice of random intervals that sum up to the desired duration
-func generateRandomIntervals(baseRPS float64, duration time.Duration) []time.Duration {
-	baseInterval := float64(time.Second) / baseRPS
-	totalTime := float64(duration)
-	var intervals []time.Duration
+// loadController manages deterministic load patterns
+type loadController struct {
+	startTime        time.Time
+	minLoadPercent   float64
+	maxLoadPercent   float64
+	rampUpDuration   float64
+	rampDownDuration float64
+}
 
-	var accumulatedTime float64
-	for accumulatedTime < totalTime {
-		// Generate variation between -150% and +150%
-		variation := (rand.Float64()*3 - 1.5) // generates number between -1.5 and 1.5
-		interval := baseInterval * (1 + variation)
-
-		// Ensure we don't generate impossibly small intervals
-		if interval < baseInterval*0.1 {
-			interval = baseInterval * 0.1
-		}
-
-		intervals = append(intervals, time.Duration(interval))
-		accumulatedTime += interval
+func newLoadController(minPercent, maxPercent, rampUpSec, rampDownSec float64) *loadController {
+	return &loadController{
+		startTime:        time.Now(),
+		minLoadPercent:   minPercent,
+		maxLoadPercent:   maxPercent,
+		rampUpDuration:   rampUpSec,
+		rampDownDuration: rampDownSec,
 	}
+}
 
-	return intervals
+func (lc *loadController) getCurrentMultiplier() float64 {
+	cycleLength := lc.rampUpDuration + lc.rampDownDuration
+	elapsed := time.Since(lc.startTime).Seconds()
+	
+	// Calculate position within the current cycle
+	position := elapsed - (float64(int(elapsed/cycleLength)) * cycleLength)
+	
+	if position < lc.rampUpDuration {
+		// During ramp up: linear interpolation from min to max
+		progress := position / lc.rampUpDuration
+		return lc.minLoadPercent/100.0 + (progress * ((lc.maxLoadPercent - lc.minLoadPercent)/100.0))
+	} else {
+		// During ramp down: linear interpolation from max to min
+		progress := (position - lc.rampUpDuration) / lc.rampDownDuration
+		return lc.maxLoadPercent/100.0 - (progress * ((lc.maxLoadPercent - lc.minLoadPercent)/100.0))
+	}
 }
 
 func RunSimulation(ctx context.Context, rdb *redis.Client, cfg SimulationConfig) []SimulationResult {
 	limiter := NewPriorityLimiter(rdb)
-	results := make([]SimulationResult, 0)
+	var results []SimulationResult
 	var mu sync.Mutex
 
-	// Create wait group for our two processes
+	// Create load controller for synchronized patterns
+	controller := newLoadController(
+		cfg.MinLoadPercent,
+		cfg.MaxLoadPercent,
+		cfg.RampUpDuration,
+		cfg.RampDownDuration,
+	)
+
+	// Create wait group for all workers
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(cfg.HighPriorityWorkers + 1) // +1 for normal priority
 
-	// High priority traffic generator with pre-generated random intervals
-	go func() {
-		defer wg.Done()
+	// Calculate base interval for each worker
+	baseWorkerRPS := cfg.HighPriorityBaseRPS / float64(cfg.HighPriorityWorkers)
 
-		// Pre-generate all random intervals for the duration
-		intervals := generateRandomIntervals(cfg.HighPriorityRPS, cfg.Duration)
+	// Launch high priority workers
+	for i := 0; i < cfg.HighPriorityWorkers; i++ {
+		go func(workerID int) {
+			defer wg.Done()
 
-		limitCfg := Config{
-			WindowSize: cfg.WindowSize,
-			Tokens:     cfg.TokensPerWindow,
-		}
+			limitCfg := Config{
+				WindowSize: cfg.WindowSize,
+				Tokens:     cfg.TokensPerWindow,
+			}
 
-		start := time.Now()
-		for _, interval := range intervals {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				allowed, _ := limiter.Allow(ctx, "sim", PriorityHigh, limitCfg)
-				now := time.Now()
-				mu.Lock()
-				results = append(results, SimulationResult{
-					Time:     now,
-					Priority: PriorityHigh,
-					Allowed:  allowed,
-				})
-				mu.Unlock()
+			start := time.Now()
+			for time.Since(start) < cfg.Duration {
+				// Get current multiplier from controller
+				multiplier := controller.getCurrentMultiplier()
+				
+				// Calculate current interval based on multiplier
+				currentRPS := baseWorkerRPS * multiplier
+				interval := time.Duration(float64(time.Second) / currentRPS)
 
-				// Sleep for the pre-generated random interval
-				time.Sleep(interval)
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					allowed, err := limiter.Allow(ctx, "sim", PriorityHigh, limitCfg)
+					if err != nil {
+						fmt.Printf("Worker %d error: %v\n", workerID, err)
+						continue
+					}
 
-				// Check if we've exceeded the duration
-				if time.Since(start) >= cfg.Duration {
-					break
+					mu.Lock()
+					results = append(results, SimulationResult{
+						Time:     time.Now(),
+						Priority: PriorityHigh,
+						Allowed:  allowed,
+					})
+					mu.Unlock()
+
+					time.Sleep(interval)
 				}
 			}
-		}
-	}()
+		}(i)
+	}
 
 	// Normal priority traffic generator
 	go func() {
 		defer wg.Done()
-		normalPriorityInterval := time.Duration(float64(time.Second) / cfg.NormalPriorityRPS)
+		normalPriorityInterval := time.Duration(float64(time.Second) / cfg.NormalPriorityBaseRPS)
 		ticker := time.NewTicker(normalPriorityInterval)
 		defer ticker.Stop()
 
@@ -135,7 +171,6 @@ func RunSimulation(ctx context.Context, rdb *redis.Client, cfg SimulationConfig)
 	return results
 }
 
-// PrintSimulationResults prints a textual visualization of the simulation results
 func PrintSimulationResults(results []SimulationResult) {
 	if len(results) == 0 {
 		return
